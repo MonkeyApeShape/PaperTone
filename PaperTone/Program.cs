@@ -242,8 +242,9 @@ internal sealed class PenMonitor : NativeWindow, IDisposable
         if (m.Msg == WT_PACKET && context != IntPtr.Zero)
         {
             var packet = new Packet();
-            uint serial = unchecked((uint)m.LParam.ToInt64());
-            if (WTPacket(context, serial, ref packet))
+            uint serial = unchecked((uint)m.WParam.ToInt64());
+            IntPtr packetContext = new IntPtr(m.LParam.ToInt64());
+            if (WTPacket(packetContext, serial, ref packet))
             {
                 packetCount++;
                 bool moving = packet.X != lastX || packet.Y != lastY;
