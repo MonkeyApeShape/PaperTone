@@ -21,11 +21,13 @@ internal sealed class TrayApp : IDisposable
     private readonly ToolStripMenuItem statusItem;
     private readonly ToolStripMenuItem enabledItem;
     private readonly ScratchAudio audio;
+    private readonly PenDiagnosticsForm diagnostics;
     private readonly PenMonitor pen;
 
     public TrayApp()
     {
         audio = new ScratchAudio();
+        diagnostics = new PenDiagnosticsForm();
 
         var menu = new ContextMenuStrip();
         statusItem = new ToolStripMenuItem("Pen: starting…") { Enabled = false };
@@ -36,6 +38,11 @@ internal sealed class TrayApp : IDisposable
         };
 
         menu.Items.Add(statusItem);
+        menu.Items.Add("Show pen monitor", null, (_, _) =>
+        {
+            diagnostics.Show();
+            diagnostics.Activate();
+        });
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("Test sound (1.5 seconds)", null, (_, _) => audio.TestSound());
 
@@ -67,15 +74,84 @@ internal sealed class TrayApp : IDisposable
 
         pen = new PenMonitor(
             (pressure, moving) => audio.SetPressure(enabledItem.Checked && moving ? pressure : 0),
-            message => statusItem.Text = message);
+            message =>
+            {
+                statusItem.Text = message;
+                diagnostics.SetStatus(message);
+            },
+            (count, x, y, rawPressure, normalizedPressure, moving) =>
+                diagnostics.UpdateReading(count, x, y, rawPressure, normalizedPressure, moving));
     }
 
     public void Dispose()
     {
         pen.Dispose();
+        diagnostics.Dispose();
         audio.Dispose();
         tray.Visible = false;
         tray.Dispose();
+    }
+}
+
+
+internal sealed class PenDiagnosticsForm : Form
+{
+    private readonly Label stateLabel;
+    private readonly Label statusLabel;
+    private readonly Label packetLabel;
+    private readonly Label pressureLabel;
+    private readonly Label positionLabel;
+    private readonly Label motionLabel;
+
+    public PenDiagnosticsForm()
+    {
+        Text = "PaperTone — Pen Monitor";
+        FormBorderStyle = FormBorderStyle.FixedToolWindow;
+        StartPosition = FormStartPosition.CenterScreen;
+        ShowInTaskbar = false;
+        TopMost = true;
+        ClientSize = new System.Drawing.Size(310, 154);
+
+        stateLabel = MakeLabel("WAITING FOR PEN", 12, 10, 286, 25, 14, true);
+        statusLabel = MakeLabel("Starting WinTab…", 12, 38, 286, 18, 8, false);
+        packetLabel = MakeLabel("Packets: 0", 12, 62, 135, 18, 9, false);
+        pressureLabel = MakeLabel("Pressure: —", 155, 62, 143, 18, 9, false);
+        positionLabel = MakeLabel("Position: —", 12, 88, 286, 18, 9, false);
+        motionLabel = MakeLabel("Movement: —", 12, 112, 286, 18, 9, false);
+
+        Controls.AddRange(new Control[] { stateLabel, statusLabel, packetLabel, pressureLabel, positionLabel, motionLabel });
+        FormClosing += (_, e) =>
+        {
+            if (e.CloseReason == CloseReason.UserClosing)
+            {
+                e.Cancel = true;
+                Hide();
+            }
+        };
+    }
+
+    private static Label MakeLabel(string text, int x, int y, int width, int height, float size, bool bold)
+    {
+        return new Label
+        {
+            Text = text,
+            Location = new System.Drawing.Point(x, y),
+            Size = new System.Drawing.Size(width, height),
+            Font = new System.Drawing.Font("Segoe UI", size, bold ? System.Drawing.FontStyle.Bold : System.Drawing.FontStyle.Regular),
+            AutoEllipsis = true
+        };
+    }
+
+    public void SetStatus(string message) => statusLabel.Text = message;
+
+    public void UpdateReading(long count, int x, int y, uint rawPressure, float normalizedPressure, bool moving)
+    {
+        bool contact = normalizedPressure > 0.005f;
+        stateLabel.Text = contact ? (moving ? "PEN DOWN — MOVING" : "PEN DOWN — STILL") : (moving ? "HOVERING — MOVING" : "HOVER / IDLE");
+        packetLabel.Text = $"Packets: {count:N0}";
+        pressureLabel.Text = $"Pressure: {rawPressure} ({normalizedPressure:P0})";
+        positionLabel.Text = $"Position: X {x:N0}   Y {y:N0}";
+        motionLabel.Text = $"Movement: {(moving ? "coordinates changing" : "coordinates unchanged")}";
     }
 }
 
@@ -178,6 +254,7 @@ internal sealed class PenMonitor : NativeWindow, IDisposable
 
     private readonly Action<float, bool> sample;
     private readonly Action<string> status;
+    private readonly Action<long, int, int, uint, float, bool> reading;
     private readonly System.Windows.Forms.Timer watchdog;
     private IntPtr context;
     private int lastX = int.MinValue;
@@ -188,10 +265,14 @@ internal sealed class PenMonitor : NativeWindow, IDisposable
     private long packetCount;
     private bool disposed;
 
-    public PenMonitor(Action<float, bool> sample, Action<string> status)
+    public PenMonitor(
+        Action<float, bool> sample,
+        Action<string> status,
+        Action<long, int, int, uint, float, bool> reading)
     {
         this.sample = sample;
         this.status = status;
+        this.reading = reading;
         CreateHandle(new CreateParams { Caption = "PaperTone global pen listener" });
 
         watchdog = new System.Windows.Forms.Timer { Interval = 12 };
@@ -252,7 +333,10 @@ internal sealed class PenMonitor : NativeWindow, IDisposable
                 lastY = packet.Y;
                 float pressure = Math.Clamp((packet.Pressure - pressureMinimum) / (float)Math.Max(1, pressureMaximum - pressureMinimum), 0f, 1f);
 
-                if (moving && pressure > 0.005f)
+                bool inContact = pressure > 0.005f;
+                reading(packetCount, packet.X, packet.Y, packet.Pressure, pressure, moving);
+
+                if (moving && inContact)
                 {
                     lastMotionAt = Environment.TickCount64;
                     sample(pressure, true);
