@@ -237,10 +237,10 @@ internal sealed class PressureScratchProvider : NAudio.Wave.ISampleProvider
     }
 }
 
-// Receives global pen packets through the tablet driver's WinTab system context.
+// Receives pen packets through a non-system WinTab digitizing context. This must not control the OS cursor.
 internal sealed class PenMonitor : NativeWindow, IDisposable
 {
-    private const uint WTI_DEFSYSCTX = 4;
+    private const uint WTI_DEFCONTEXT = 3;
     private const uint WTI_DEVICES = 100;
     private const uint DVC_NPRESSURE = 15;
     private const uint CXO_SYSTEM = 0x0001;
@@ -286,10 +286,12 @@ internal sealed class PenMonitor : NativeWindow, IDisposable
         try
         {
             var lc = new LogContext { Name = new string('\0', 40) };
-            if (WTInfoA(WTI_DEFSYSCTX, 0, ref lc) == 0)
-                throw new InvalidOperationException("The tablet driver did not provide a WinTab system context.");
+            if (WTInfoA(WTI_DEFCONTEXT, 0, ref lc) == 0)
+                throw new InvalidOperationException("The tablet driver did not provide a WinTab digitizing context.");
 
-            lc.Options |= CXO_SYSTEM | CXO_MESSAGES;
+            // Request packet messages without claiming system-cursor control.
+            lc.Options &= ~CXO_SYSTEM;
+            lc.Options |= CXO_MESSAGES;
             lc.MessageBase = WT_DEFBASE;
             lc.PacketData = PK_X | PK_Y | PK_NORMAL_PRESSURE;
             lc.PacketMode = 0;
@@ -304,7 +306,7 @@ internal sealed class PenMonitor : NativeWindow, IDisposable
 
             context = WTOpenA(Handle, ref lc, true);
             if (context == IntPtr.Zero)
-                throw new InvalidOperationException("The WinTab system context could not be opened. Verify the Huion driver and WinTab support.");
+                throw new InvalidOperationException("The WinTab digitizing context could not be opened. Verify the Huion driver and WinTab support.");
 
             status($"Pen: connected; waiting for packets ({pressureMinimum}–{pressureMaximum})");
         }
