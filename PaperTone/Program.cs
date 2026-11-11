@@ -22,7 +22,6 @@ internal sealed class TrayApp : IDisposable
     private readonly ToolStripMenuItem enabledItem;
     private readonly ScratchAudio audio;
     private readonly PenMonitor pen;
-    private bool enabled = true;
 
     public TrayApp()
     {
@@ -33,9 +32,12 @@ internal sealed class TrayApp : IDisposable
         enabledItem = new ToolStripMenuItem("Sound enabled") { Checked = true, CheckOnClick = true };
         enabledItem.CheckedChanged += (_, _) =>
         {
-            enabled = enabledItem.Checked;
-            if (!enabled) audio.SetPressure(0);
+            if (!enabledItem.Checked) audio.SetPressure(0);
         };
+
+        menu.Items.Add(statusItem);
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("Test sound (1.5 seconds)", null, (_, _) => audio.TestSound());
 
         var volumeMenu = new ToolStripMenuItem("Volume");
         foreach (var level in new[] { 25, 50, 75, 100 })
@@ -50,8 +52,6 @@ internal sealed class TrayApp : IDisposable
             volumeMenu.DropDownItems.Add(item);
         }
 
-        menu.Items.Add(statusItem);
-        menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(enabledItem);
         menu.Items.Add(volumeMenu);
         menu.Items.Add(new ToolStripSeparator());
@@ -66,7 +66,7 @@ internal sealed class TrayApp : IDisposable
         };
 
         pen = new PenMonitor(
-            (pressure, moving) => audio.SetPressure(enabled && moving ? pressure : 0),
+            (pressure, moving) => audio.SetPressure(enabledItem.Checked && moving ? pressure : 0),
             message => statusItem.Text = message);
     }
 
@@ -83,25 +83,47 @@ internal sealed class ScratchAudio : IDisposable
 {
     private readonly WaveOutEvent output;
     private readonly PressureScratchProvider source;
+    private readonly System.Windows.Forms.Timer testTimer;
 
     public ScratchAudio()
     {
         source = new PressureScratchProvider(48000);
-        output = new WaveOutEvent { DesiredLatency = 30, NumberOfBuffers = 2 };
+        output = new WaveOutEvent { DesiredLatency = 50, NumberOfBuffers = 3 };
         output.Init(source);
         output.Play();
+
+        testTimer = new System.Windows.Forms.Timer { Interval = 1500 };
+        testTimer.Tick += (_, _) =>
+        {
+            testTimer.Stop();
+            source.TestPressure = 0;
+        };
     }
 
     public void SetPressure(float pressure) => source.Pressure = Math.Clamp(pressure, 0f, 1f);
     public void SetMasterVolume(float volume) => source.MasterVolume = Math.Clamp(volume, 0f, 1f);
-    public void Dispose() => output.Dispose();
+
+    public void TestSound()
+    {
+        source.TestPressure = 0.8f;
+        testTimer.Stop();
+        testTimer.Start();
+    }
+
+    public void Dispose()
+    {
+        testTimer.Stop();
+        testTimer.Dispose();
+        output.Dispose();
+    }
 }
 
-// Prototype paper-grain synthesizer. Pressure controls loudness and grain density.
+// Procedural paper-grain sound. TestPressure lets the tray menu test audio independently of the pen.
 internal sealed class PressureScratchProvider : NAudio.Wave.ISampleProvider
 {
     private readonly Random random = new();
     private float pressure;
+    private float testPressure;
     private float master = 0.75f;
     private float filtered;
     private float envelope;
@@ -113,15 +135,16 @@ internal sealed class PressureScratchProvider : NAudio.Wave.ISampleProvider
 
     public WaveFormat WaveFormat { get; }
     public float Pressure { get => Volatile.Read(ref pressure); set => Volatile.Write(ref pressure, value); }
+    public float TestPressure { get => Volatile.Read(ref testPressure); set => Volatile.Write(ref testPressure, value); }
     public float MasterVolume { get => Volatile.Read(ref master); set => Volatile.Write(ref master, value); }
 
     public int Read(float[] buffer, int offset, int count)
     {
         for (int i = 0; i < count; i++)
         {
-            float p = Pressure;
+            float p = Math.Max(Pressure, TestPressure);
             float target = p < 0.02f ? 0f : MathF.Pow(p, 0.72f);
-            envelope += (target - envelope) * (target > envelope ? 0.035f : 0.012f);
+            envelope += (target - envelope) * (target > envelope ? 0.0035f : 0.0012f);
 
             float white = (float)(random.NextDouble() * 2.0 - 1.0);
             filtered = filtered * 0.72f + white * 0.28f;
@@ -132,7 +155,7 @@ internal sealed class PressureScratchProvider : NAudio.Wave.ISampleProvider
             }
 
             float texture = filtered * 0.72f + grain * 0.28f;
-            buffer[offset + i] = Math.Clamp(texture * envelope * MasterVolume * 0.20f, -0.95f, 0.95f);
+            buffer[offset + i] = Math.Clamp(texture * envelope * MasterVolume * 0.55f, -0.95f, 0.95f);
         }
         return count;
     }
@@ -151,7 +174,7 @@ internal sealed class PenMonitor : NativeWindow, IDisposable
     private const uint PK_NORMAL_PRESSURE = 0x0400;
     private const uint WT_DEFBASE = 0x7FF0;
     private const int WT_PACKET = 0x7FF0;
-    private const int MotionTimeoutMs = 45;
+    private const int MotionTimeoutMs = 60;
 
     private readonly Action<float, bool> sample;
     private readonly Action<string> status;
@@ -159,8 +182,10 @@ internal sealed class PenMonitor : NativeWindow, IDisposable
     private IntPtr context;
     private int lastX = int.MinValue;
     private int lastY = int.MinValue;
+    private int pressureMinimum;
     private int pressureMaximum = 1023;
     private long lastMotionAt;
+    private long packetCount;
     private bool disposed;
 
     public PenMonitor(Action<float, bool> sample, Action<string> status)
@@ -191,13 +216,16 @@ internal sealed class PenMonitor : NativeWindow, IDisposable
 
             var axis = new Axis();
             if (WTInfoAxis(WTI_DEVICES + lc.Device, DVC_NPRESSURE, ref axis) != 0 && axis.Max > axis.Min)
-                pressureMaximum = axis.Max - axis.Min;
+            {
+                pressureMinimum = axis.Min;
+                pressureMaximum = axis.Max;
+            }
 
             context = WTOpenA(Handle, ref lc, true);
             if (context == IntPtr.Zero)
                 throw new InvalidOperationException("The WinTab system context could not be opened. Verify the Huion driver and WinTab support.");
 
-            status($"Pen: WinTab connected (0–{pressureMaximum})");
+            status($"Pen: connected; waiting for packets ({pressureMinimum}–{pressureMaximum})");
         }
         catch (DllNotFoundException)
         {
@@ -217,12 +245,13 @@ internal sealed class PenMonitor : NativeWindow, IDisposable
             uint serial = unchecked((uint)m.LParam.ToInt64());
             if (WTPacket(context, serial, ref packet))
             {
+                packetCount++;
                 bool moving = packet.X != lastX || packet.Y != lastY;
                 lastX = packet.X;
                 lastY = packet.Y;
-                float pressure = Math.Clamp((packet.Pressure / (float)pressureMaximum), 0f, 1f);
+                float pressure = Math.Clamp((packet.Pressure - pressureMinimum) / (float)Math.Max(1, pressureMaximum - pressureMinimum), 0f, 1f);
 
-                if (moving && pressure > 0.015f)
+                if (moving && pressure > 0.005f)
                 {
                     lastMotionAt = Environment.TickCount64;
                     sample(pressure, true);
@@ -231,6 +260,13 @@ internal sealed class PenMonitor : NativeWindow, IDisposable
                 {
                     sample(0f, false);
                 }
+
+                if (packetCount == 1 || packetCount % 30 == 0)
+                    status($"Pen: receiving packets ({packetCount}); pressure {packet.Pressure}; {(moving && pressure > 0.005f ? "drawing" : "hover/idle")}");
+            }
+            else
+            {
+                status("Pen: packet message received, but WTPacket failed");
             }
         }
         base.WndProc(ref m);
